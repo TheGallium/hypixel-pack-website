@@ -14,6 +14,7 @@ let currentSubPath = "";
 const expanded = new Set();
 let globalLastCommitDate = null;
 let activeCategoryFilter = null;
+let viewingGroup = null;
 
 function matchesCategoryFilter(item) {
   if (!activeCategoryFilter) return true;
@@ -172,6 +173,25 @@ function categoryFor(name) {
   return "text";
 }
 
+function groupBranchName(name) {
+  const idx = name.indexOf("/");
+  return idx === -1 ? null : name.slice(0, idx);
+}
+
+function getBranchGroups(list) {
+  const groups = {};
+  const standalone = [];
+  for (const b of list) {
+    const prefix = groupBranchName(b);
+    if (prefix) {
+      (groups[prefix] = groups[prefix] || []).push(b);
+    } else {
+      standalone.push(b);
+    }
+  }
+  return { groups, standalone };
+}
+
 // ---------- Routing ----------
 
 function parseHash() {
@@ -235,10 +255,12 @@ async function handleRoute() {
     els.search.value = "";
 
     if (!branch) {
+        viewingGroup = null;
         renderRootBranchList();
         return;
     }
 
+    viewingGroup = null;
     els.status.textContent = `Loading ${branch}...`;
     try {
         await ensureBranchLoaded(branch);
@@ -262,6 +284,8 @@ async function handleRoute() {
 
 function ensureSidebarExpanded(branch, subPath) {
   expanded.add(branch);
+  const groupPrefix = groupBranchName(branch);
+  if (groupPrefix) expanded.add(`group:${groupPrefix}`);
   if (!subPath) return;
   const parts = subPath.split("/");
   let acc = "";
@@ -288,13 +312,24 @@ function renderSidebar() {
   rootLi.appendChild(rootRow);
 
   const branchUl = document.createElement("ul");
-  for (const b of branches) branchUl.appendChild(makeBranchNode(b));
+  const { groups } = getBranchGroups(branches);
+  const seenGroups = new Set();
+  for (const b of branches) {
+    const prefix = groupBranchName(b);
+    if (prefix) {
+      if (seenGroups.has(prefix)) continue;
+      seenGroups.add(prefix);
+      branchUl.appendChild(makeBranchGroupNode(prefix, groups[prefix]));
+    } else {
+      branchUl.appendChild(makeBranchNode(b));
+    }
+  }
   rootLi.appendChild(branchUl);
   rootUl.appendChild(rootLi);
   els.sidebar.appendChild(rootUl);
 }
 
-function makeBranchNode(branchName) {
+function makeBranchNode(branchName, displayLabel) {
   const li = document.createElement("li");
   const row = document.createElement("div");
   row.className = "tree-row" + (currentBranch === branchName && !currentSubPath ? " active" : "");
@@ -335,7 +370,7 @@ function makeBranchNode(branchName) {
   row.appendChild(caret);
 
   const label = document.createElement("span");
-  label.textContent = "📁 " + branchName;
+  label.textContent = "📁 " + (displayLabel || branchName);
   row.appendChild(label);
   li.appendChild(row);
 
@@ -343,6 +378,44 @@ function makeBranchNode(branchName) {
     const ul = document.createElement("ul");
     const dirNames = Object.keys(branchCache[branchName].tree.__dirs).sort();
     for (const name of dirNames) ul.appendChild(makeDirTreeNode(branchName, name, name));
+    li.appendChild(ul);
+  }
+  return li;
+}
+
+function makeBranchGroupNode(prefix, branchList) {
+  const key = `group:${prefix}`;
+  const li = document.createElement("li");
+  const row = document.createElement("div");
+  row.className = "tree-row" + (viewingGroup === prefix ? " active" : "");
+
+  const isOpen = expanded.has(key);
+  const caret = document.createElement("span");
+  caret.className = "tree-caret" + (isOpen ? " open" : "");
+  caret.textContent = "▸";
+
+  function toggleGroupExpand() {
+    if (expanded.has(key)) expanded.delete(key); else expanded.add(key);
+    renderSidebar();
+  }
+
+  row.onclick = toggleGroupExpand;
+  caret.onclick = (e) => {
+    e.stopPropagation();
+    toggleGroupExpand();
+  };
+  row.appendChild(caret);
+
+  const label = document.createElement("span");
+  label.textContent = "📁 " + prefix;
+  row.appendChild(label);
+  li.appendChild(row);
+
+  if (isOpen) {
+    const ul = document.createElement("ul");
+    for (const b of branchList) {
+      ul.appendChild(makeBranchNode(b, b.slice(prefix.length + 1)));
+    }
     li.appendChild(ul);
   }
   return li;
@@ -434,7 +507,6 @@ function renderBreadcrumb() {
 // ---------- Grid ----------
 
 function renderRootBranchList(filterQuery = "") {
-  renderBreadcrumbRoot();
   renderSidebar();
   els.grid.innerHTML = "";
   
@@ -447,12 +519,64 @@ function renderRootBranchList(filterQuery = "") {
   }
 
   const q = filterQuery.trim().toLowerCase();
-  const list = q ? branches.filter(b => b.toLowerCase().includes(q)) : branches;
-  if (!list.length) {
+  if (q) {
+    viewingGroup = null;
+    renderBreadcrumbRoot();
+    const list = branches.filter(b => b.toLowerCase().includes(q));
+    if (!list.length) {
+      els.grid.innerHTML = `<div class="empty">No versions match.</div>`;
+      return;
+    }
+    for (const b of list) {
+      const slot = document.createElement("div");
+      slot.className = "slot slot-branch";
+      slot.innerHTML = `<div class="slot-preview">📁</div><div class="slot-label">${escapeHtml(b)}</div>`;
+      slot.onclick = () => navigateTo(b);
+      els.grid.appendChild(slot);
+    }
+    return;
+  }
+
+  if (viewingGroup) {
+    renderGroupCrumb(viewingGroup);
+    const branchesInGroup = branches.filter(b => groupBranchName(b) === viewingGroup);
+    els.status.textContent = `${branchesInGroup.length} versions in ${viewingGroup}`;
+    if (!branchesInGroup.length) {
+      els.grid.innerHTML = `<div class="empty">No versions here.</div>`;
+      return;
+    }
+    for (const b of branchesInGroup) {
+      const slot = document.createElement("div");
+      slot.className = "slot slot-branch";
+      const suffix = b.slice(viewingGroup.length + 1);
+      slot.innerHTML = `<div class="slot-preview">📁</div><div class="slot-label">${escapeHtml(suffix)}</div>`;
+      slot.onclick = () => navigateTo(b);
+      els.grid.appendChild(slot);
+    }
+    return;
+  }
+
+  renderBreadcrumbRoot();
+  const { groups, standalone } = getBranchGroups(branches);
+  const groupNames = Object.keys(groups).sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }));
+
+  if (!groupNames.length && !standalone.length) {
     els.grid.innerHTML = `<div class="empty">No versions match.</div>`;
     return;
   }
-  for (const b of list) {
+
+  for (const g of groupNames) {
+    const slot = document.createElement("div");
+    slot.className = "slot slot-dir";
+    slot.innerHTML = `<div class="slot-preview">📁</div><div class="slot-label">${escapeHtml(g)}</div>`;
+    slot.onclick = () => {
+      viewingGroup = g;
+      expanded.add(`group:${g}`);
+      renderRootBranchList();
+    };
+    els.grid.appendChild(slot);
+  }
+  for (const b of standalone) {
     const slot = document.createElement("div");
     slot.className = "slot slot-branch";
     slot.innerHTML = `<div class="slot-preview">📁</div><div class="slot-label">${escapeHtml(b)}</div>`;
@@ -467,6 +591,24 @@ function renderBreadcrumbRoot() {
   rootCrumb.className = "crumb";
   rootCrumb.textContent = REPO_CONFIG.repo;
   els.breadcrumb.appendChild(rootCrumb);
+}
+
+function renderGroupCrumb(group) {
+  els.breadcrumb.innerHTML = "";
+  const rootCrumb = document.createElement("span");
+  rootCrumb.className = "crumb";
+  rootCrumb.textContent = REPO_CONFIG.repo;
+  rootCrumb.onclick = () => {
+    viewingGroup = null;
+    renderRootBranchList();
+  };
+  els.breadcrumb.appendChild(rootCrumb);
+
+  addCrumbSep();
+  const groupCrumb = document.createElement("span");
+  groupCrumb.className = "crumb";
+  groupCrumb.textContent = group;
+  els.breadcrumb.appendChild(groupCrumb);
 }
 
 function addCrumbSep() {
