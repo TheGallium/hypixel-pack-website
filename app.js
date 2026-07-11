@@ -41,10 +41,26 @@ els.filterBar.addEventListener("click", (e) => {
   els.search.dispatchEvent(new Event("input"));
 });
 
+if (els.lastUpdated) {
+  els.lastUpdated.addEventListener("click", () => {
+    if (currentBranch) openDiffModal(currentBranch);
+  });
+}
+
+function updateChangesButton() {
+  if (!els.lastUpdated) return;
+  els.lastUpdated.classList.toggle("clickable", !!currentBranch);
+  els.lastUpdated.title = currentBranch ? "Click to compare with the previous version" : "";
+}
+
 function rawUrl(branch, path) {
   const cached = branchCache[branch];
   const ref = cached && cached.sha ? cached.sha : encodeURIComponent(branch);
   return `${RAW_BASE}/${REPO_CONFIG.owner}/${REPO_CONFIG.repo}/${ref}/${path}`;
+}
+
+function rawUrlAtSha(sha, path) {
+  return `${RAW_BASE}/${REPO_CONFIG.owner}/${REPO_CONFIG.repo}/${sha}/${path}`;
 }
 
 // ---------- Data stuff ----------
@@ -257,6 +273,7 @@ async function handleRoute() {
     if (!branch) {
         viewingGroup = null;
         renderRootBranchList();
+        updateChangesButton();
         return;
     }
 
@@ -266,6 +283,7 @@ async function handleRoute() {
         await ensureBranchLoaded(branch);
         els.status.textContent = `${branchCache[branch].fileIndex.length} files in ${branch}`;
         renderLastUpdated(branchCache[branch].date);
+        updateChangesButton();
         renderBreadcrumb();
         ensureSidebarExpanded(branch, subPath);
         renderSidebar();
@@ -277,6 +295,10 @@ async function handleRoute() {
         console.error(e);
         els.status.textContent = `Couldn't load "${branch}"`;
         els.grid.innerHTML = `<div class="empty">Couldn't load this version.</div>`;
+        if (els.lastUpdated) {
+            els.lastUpdated.classList.remove("clickable");
+            els.lastUpdated.title = "";
+        }
     }
 }
 
@@ -774,6 +796,172 @@ async function openDetail(branch, item, cat) {
     copyBtn.textContent = "Copied!";
     setTimeout(() => (copyBtn.textContent = "Copy link"), 1500);
   };
+}
+
+// ---------- Diff ----------
+
+async function openDiffModal(branch) {
+  const data = branchCache[branch];
+  if (!data) return;
+
+  els.modal.classList.add("open");
+  els.modal.setAttribute("aria-hidden", "false");
+  els.modalBody.innerHTML = `<div class="modal-loading">Finding the previous version...</div>`;
+
+  try {
+    const commitRes = await fetch(`${API_BASE}/repos/${REPO_CONFIG.owner}/${REPO_CONFIG.repo}/commits/${data.sha}`);
+    if (!commitRes.ok) {
+      if (commitRes.status === 403) throw new Error("GitHub API rate limit hit - try again shortly.");
+      throw new Error(`GitHub API error ${commitRes.status} resolving commit history`);
+    }
+    const commit = await commitRes.json();
+    const parentSha = commit.parents && commit.parents[0] && commit.parents[0].sha;
+    if (!parentSha) {
+      els.modalBody.innerHTML = `<div class="empty">This is the first version of this branch - nothing to compare against.</div>`;
+      return;
+    }
+
+    els.modalBody.innerHTML = `<div class="modal-loading">Comparing versions...</div>`;
+    const res = await fetch(`${API_BASE}/repos/${REPO_CONFIG.owner}/${REPO_CONFIG.repo}/compare/${parentSha}...${data.sha}`);
+    if (!res.ok) {
+      if (res.status === 403) throw new Error("GitHub API rate limit hit - try again shortly.");
+      throw new Error(`GitHub API error ${res.status} comparing versions`);
+    }
+    const cmp = await res.json();
+    renderDiff(branch, cmp, parentSha, data.sha);
+  } catch (e) {
+    console.error(e);
+    els.modalBody.innerHTML = `<div class="modal-error">${escapeHtml(e.message || "Couldn't load the diff.")}</div>`;
+  }
+}
+
+const DIFF_STATUS_BADGE = { added: "+", removed: "-", modified: "±", renamed: "→", changed: "±" };
+
+function renderDiff(branch, cmp, parentSha, currentSha) {
+  const files = cmp.files || [];
+
+  els.modalBody.innerHTML = `
+    <div class="modal-title">New changes to ${escapeHtml(branch)}</div>
+    <div class="diff-toolbar">
+      <div class="diff-summary">${files.length} file${files.length === 1 ? "" : "s"} changed</div>
+      <div class="diff-toolbar-actions">
+        <button type="button" class="diff-toggle-all" data-action="expand">Expand all</button>
+        <button type="button" class="diff-toggle-all" data-action="collapse">Collapse all</button>
+      </div>
+    </div>
+  `;
+
+  if (!files.length) {
+    els.modalBody.insertAdjacentHTML("beforeend", `<div class="empty">No file changes detected.</div>`);
+    return;
+  }
+
+  const list = document.createElement("div");
+  list.className = "diff-list";
+  const itemControls = [];
+
+  for (const f of files) {
+    const item = document.createElement("div");
+    item.className = "diff-item";
+
+    const row = document.createElement("div");
+    row.className = "diff-row";
+    const badge = DIFF_STATUS_BADGE[f.status] || "~";
+    const statsParts = [];
+    if (f.additions) statsParts.push(`+${f.additions}`);
+    if (f.deletions) statsParts.push(`-${f.deletions}`);
+
+    row.innerHTML = `
+      <span class="diff-badge diff-${f.status}">${badge}</span>
+      <span class="diff-filename">${escapeHtml(f.status === "renamed" ? `${f.previous_filename} → ${f.filename}` : f.filename)}</span>
+      <span class="diff-stats">${statsParts.join(" ")}</span>
+    `;
+    row.style.cursor = "pointer";
+    row.title = "Click to expand";
+
+    const expando = document.createElement("div");
+    expando.className = "diff-expando";
+    expando.style.display = "none";
+    let loaded = false;
+
+    function setOpen(open) {
+      expando.style.display = open ? "" : "none";
+      if (open && !loaded) {
+        fillDiffExpando(expando, f, parentSha, currentSha);
+        loaded = true;
+      }
+    }
+
+    row.onclick = () => setOpen(expando.style.display === "none");
+    itemControls.push(setOpen);
+
+    item.appendChild(row);
+    item.appendChild(expando);
+    list.appendChild(item);
+  }
+
+  els.modalBody.appendChild(list);
+
+  els.modalBody.querySelectorAll(".diff-toggle-all").forEach(btn => {
+    btn.onclick = () => {
+      const open = btn.dataset.action === "expand";
+      itemControls.forEach(setOpen => setOpen(open));
+    };
+  });
+}
+
+function fillDiffExpando(container, f, parentSha, currentSha) {
+  if (f.patch) {
+    container.innerHTML = buildPatchHtml(f.patch);
+    return;
+  }
+
+  const cat = categoryFor(f.filename);
+  if (cat === "image" || cat === "audio") {
+    const blocks = [];
+    const oldPath = f.status === "renamed" ? f.previous_filename : f.filename;
+
+    if (f.status !== "added" && parentSha) {
+      blocks.push(mediaPreviewBlock("Before", rawUrlAtSha(parentSha, oldPath), cat, f.filename));
+    }
+    if (f.status !== "removed" && currentSha) {
+      blocks.push(mediaPreviewBlock("After", rawUrlAtSha(currentSha, f.filename), cat, f.filename));
+    }
+
+    container.innerHTML = `<div class="diff-media">${blocks.join("")}</div>`;
+    return;
+  }
+
+  container.innerHTML = `<div class="diff-nopatch">No preview available for this file.</div>`;
+}
+
+function mediaPreviewBlock(label, url, cat, name) {
+  if (cat === "image") {
+    return `
+      <div class="diff-media-item">
+        <div class="diff-media-label">${label}</div>
+        <div class="diff-media-preview checker"><img loading="lazy" src="${url}" alt="${escapeHtml(name)}"></div>
+      </div>`;
+  }
+  return `
+    <div class="diff-media-item">
+      <div class="diff-media-label">${label}</div>
+      <audio controls src="${url}"></audio>
+    </div>`;
+}
+
+function buildPatchHtml(patch) {
+  const highlighted = patch
+    .split("\n")
+    .map(line => {
+      let cls = "";
+      if (line.startsWith("+") && !line.startsWith("+++")) cls = "diff-add";
+      else if (line.startsWith("-") && !line.startsWith("---")) cls = "diff-remove";
+      else if (line.startsWith("@@")) cls = "diff-hunk";
+      return `<span class="${cls}">${escapeHtml(line)}</span>`;
+    })
+    .join("");
+  return `<pre class="modal-text diff-patch">${highlighted}</pre>`;
 }
 
 function closeModal() {
