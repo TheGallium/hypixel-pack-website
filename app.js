@@ -210,19 +210,33 @@ function getBranchGroups(list) {
 
 // ---------- Routing ----------
 
+function encodeHashSegment(str) {
+  return str.split('/').map(encodeURIComponent).join('/');
+}
+
 function parseHash() {
-  const raw = location.hash.replace(/^#\/?/, "");
-  if (!raw) return { branch: null, subPath: "" };
+  let raw = location.hash.replace(/^#\/?/, "");
+  if (!raw) return { branch: null, subPath: "", diff: null };
+
+  let diff = null;
+  const qIndex = raw.indexOf("?");
+  if (qIndex !== -1) {
+    const query = new URLSearchParams(raw.slice(qIndex + 1));
+    diff = query.get("diff");
+    raw = raw.slice(0, qIndex);
+  }
+
+  if (!raw) return { branch: null, subPath: "", diff };
 
   const decodedRaw = raw.split('/').map(decodeURIComponent).join('/');
 
   const sortedBranches = [...branches].sort((a, b) => b.length - a.length);
   for (const b of sortedBranches) {
     if (decodedRaw === b) {
-      return { branch: b, subPath: "" }; 
+      return { branch: b, subPath: "", diff };
     }
     if (decodedRaw.startsWith(b + "/")) {
-      return { branch: b, subPath: decodedRaw.slice(b.length + 1) };
+      return { branch: b, subPath: decodedRaw.slice(b.length + 1), diff };
     }
   }
 
@@ -231,13 +245,15 @@ function parseHash() {
   if (parts.length > 1 && parts[0].toLowerCase() === "alpha") {
     return {
       branch: `${parts[0]}/${parts[1]}`,
-      subPath: parts.slice(2).join("/")
+      subPath: parts.slice(2).join("/"),
+      diff
     };
   }
 
   return { 
     branch: parts[0], 
-    subPath: parts.slice(1).join("/") 
+    subPath: parts.slice(1).join("/"),
+    diff
   };
 }
 
@@ -246,12 +262,10 @@ function navigateTo(branch, subPath = "") {
     if (location.hash !== "#/") location.hash = "#/";
     return;
   }
-  
-  const encodeParts = (str) => str.split('/').map(encodeURIComponent).join('/');
-  
-  let hash = `#/${encodeParts(branch)}`;
+
+  let hash = `#/${encodeHashSegment(branch)}`;
   if (subPath) {
-    hash += `/${encodeParts(subPath)}`;
+    hash += `/${encodeHashSegment(subPath)}`;
   }
 
   if (location.hash === hash) { 
@@ -265,7 +279,7 @@ window.addEventListener("hashchange", handleRoute);
 
 async function handleRoute() {
     closeModal();
-    const { branch, subPath } = parseHash();
+    const { branch, subPath, diff } = parseHash();
     currentBranch = branch;
     currentSubPath = subPath;
     els.search.value = "";
@@ -291,6 +305,11 @@ async function handleRoute() {
         if (activeRow) activeRow.scrollIntoView({ block: "nearest" });
         const node = nodeAtPath(branchCache[branch].tree, subPath);
         renderGrid(node || branchCache[branch].tree, branch);
+
+        if (diff) {
+            const [base, head] = diff.split("...");
+            if (base && head) openDiffModal(branch, base, head);
+        }
     } catch (e) {
         console.error(e);
         els.status.textContent = `Couldn't load "${branch}"`;
@@ -800,35 +819,54 @@ async function openDetail(branch, item, cat) {
 
 // ---------- Diff ----------
 
-async function openDiffModal(branch) {
+async function copyTextToClipboard(text) {
+  if (window.isSecureContext && navigator.clipboard && navigator.clipboard.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (e) {
+      console.warn("Failed to copy.", e);
+    }
+  }
+}
+
+async function openDiffModal(branch, explicitBase = null, explicitHead = null) {
   const data = branchCache[branch];
   if (!data) return;
 
   els.modal.classList.add("open");
   els.modal.setAttribute("aria-hidden", "false");
-  els.modalBody.innerHTML = `<div class="modal-loading">Finding the previous version...</div>`;
+
+  const currentSha = explicitHead || data.sha;
+  let parentSha = explicitBase;
+  let headDate = null;
 
   try {
-    const commitRes = await fetch(`${API_BASE}/repos/${REPO_CONFIG.owner}/${REPO_CONFIG.repo}/commits/${data.sha}`);
+    els.modalBody.innerHTML = `<div class="modal-loading">${parentSha ? "Comparing versions..." : "Finding the previous version..."}</div>`;
+    const commitRes = await fetch(`${API_BASE}/repos/${REPO_CONFIG.owner}/${REPO_CONFIG.repo}/commits/${currentSha}`);
     if (!commitRes.ok) {
       if (commitRes.status === 403) throw new Error("GitHub API rate limit hit - try again shortly.");
       throw new Error(`GitHub API error ${commitRes.status} resolving commit history`);
     }
     const commit = await commitRes.json();
-    const parentSha = commit.parents && commit.parents[0] && commit.parents[0].sha;
+    headDate = (commit.commit && (commit.commit.committer?.date || commit.commit.author?.date)) || null;
+
     if (!parentSha) {
-      els.modalBody.innerHTML = `<div class="empty">This is the first version of this branch - nothing to compare against.</div>`;
-      return;
+      parentSha = commit.parents && commit.parents[0] && commit.parents[0].sha;
+      if (!parentSha) {
+        els.modalBody.innerHTML = `<div class="empty">This is the first version of this branch - nothing to compare against.</div>`;
+        return;
+      }
     }
 
     els.modalBody.innerHTML = `<div class="modal-loading">Comparing versions...</div>`;
-    const res = await fetch(`${API_BASE}/repos/${REPO_CONFIG.owner}/${REPO_CONFIG.repo}/compare/${parentSha}...${data.sha}`);
+    const res = await fetch(`${API_BASE}/repos/${REPO_CONFIG.owner}/${REPO_CONFIG.repo}/compare/${parentSha}...${currentSha}`);
     if (!res.ok) {
       if (res.status === 403) throw new Error("GitHub API rate limit hit - try again shortly.");
       throw new Error(`GitHub API error ${res.status} comparing versions`);
     }
     const cmp = await res.json();
-    renderDiff(branch, cmp, parentSha, data.sha);
+    renderDiff(branch, cmp, parentSha, currentSha, headDate);
   } catch (e) {
     console.error(e);
     els.modalBody.innerHTML = `<div class="modal-error">${escapeHtml(e.message || "Couldn't load the diff.")}</div>`;
@@ -837,19 +875,37 @@ async function openDiffModal(branch) {
 
 const DIFF_STATUS_BADGE = { added: "+", removed: "-", modified: "±", renamed: "→", changed: "±" };
 
-function renderDiff(branch, cmp, parentSha, currentSha) {
+function renderDiff(branch, cmp, parentSha, currentSha, headDate) {
   const files = cmp.files || [];
+  const dateLabel = headDate
+    ? new Date(headDate).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+    : null;
+  const title = `Changes on ${dateLabel} to ${escapeHtml(branch)}`;
 
   els.modalBody.innerHTML = `
-    <div class="modal-title">New changes to ${escapeHtml(branch)}</div>
+    <div class="modal-title">${title}</div>
+    <div class="modal-path">${escapeHtml(branch)}</div>
     <div class="diff-toolbar">
       <div class="diff-summary">${files.length} file${files.length === 1 ? "" : "s"} changed</div>
       <div class="diff-toolbar-actions">
         <button type="button" class="diff-toggle-all" data-action="expand">Expand all</button>
         <button type="button" class="diff-toggle-all" data-action="collapse">Collapse all</button>
+        <button type="button" class="diff-copy-link">🔗 Copy link</button>
       </div>
     </div>
   `;
+
+  const copyLinkBtn = els.modalBody.querySelector(".diff-copy-link");
+  if (copyLinkBtn) {
+    copyLinkBtn.onclick = async () => {
+      const hash = `#/${encodeHashSegment(branch)}?diff=${parentSha}...${currentSha}`;
+      const url = `${location.origin}${location.pathname}${hash}`;
+      const originalText = copyLinkBtn.textContent;
+      const ok = await copyTextToClipboard(url);
+      copyLinkBtn.textContent = ok ? "🔗 Copied!" : "🔗 Couldn't copy";
+      setTimeout(() => { copyLinkBtn.textContent = originalText; }, 1800);
+    };
+  }
 
   if (!files.length) {
     els.modalBody.insertAdjacentHTML("beforeend", `<div class="empty">No file changes detected.</div>`);

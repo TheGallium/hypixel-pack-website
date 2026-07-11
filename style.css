@@ -424,7 +424,7 @@ a:hover { color: var(--text); }
   gap: 6px;
 }
 
-.diff-toggle-all {
+.diff-toggle-all, .diff-copy-link {
   background: var(--primary);
   border: none;
   color: var(--text);
@@ -435,7 +435,7 @@ a:hover { color: var(--text); }
   cursor: pointer;
   white-space: nowrap;
 }
-.diff-toggle-all:hover { background: var(--secondary); color: #fff; }
+.diff-toggle-all:hover, .diff-copy-link:hover { background: var(--secondary); color: #fff; }
 
 .diff-list {
   display: flex;
