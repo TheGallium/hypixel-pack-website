@@ -15,6 +15,7 @@ const expanded = new Set();
 let globalLastCommitDate = null;
 let activeCategoryFilter = null;
 let viewingGroup = null;
+let currentOpenFile = null;
 
 function matchesCategoryFilter(item) {
   if (!activeCategoryFilter) return true;
@@ -257,6 +258,26 @@ function parseHash() {
   };
 }
 
+function fileHash(branch, item) {
+  return `#/${encodeHashSegment(branch)}/${encodeHashSegment(item.path)}`;
+}
+
+function buildFileLink(branch, item) {
+  return `${location.origin}${location.pathname}${fileHash(branch, item)}`;
+}
+
+function setHashSilently(hash, { push = true } = {}) {
+  const url = location.pathname + location.search + hash;
+  if (push) history.pushState(null, "", url);
+  else history.replaceState(null, "", url);
+}
+
+function folderHash(branch, subPath) {
+  let hash = `#/${encodeHashSegment(branch)}`;
+  if (subPath) hash += `/${encodeHashSegment(subPath)}`;
+  return hash;
+}
+
 function navigateTo(branch, subPath = "") {
   if (!branch) {
     if (location.hash !== "#/") location.hash = "#/";
@@ -278,14 +299,14 @@ function navigateTo(branch, subPath = "") {
 window.addEventListener("hashchange", handleRoute);
 
 async function handleRoute() {
-    closeModal();
+    closeModal(false);
     const { branch, subPath, diff } = parseHash();
     currentBranch = branch;
-    currentSubPath = subPath;
     els.search.value = "";
 
     if (!branch) {
         viewingGroup = null;
+        currentSubPath = "";
         renderRootBranchList();
         updateChangesButton();
         return;
@@ -295,20 +316,35 @@ async function handleRoute() {
     els.status.textContent = `Loading ${branch}...`;
     try {
         await ensureBranchLoaded(branch);
+
+        let dirPath = subPath;
+        let fileToOpen = null;
+        if (subPath && !nodeAtPath(branchCache[branch].tree, subPath)) {
+            const match = branchCache[branch].fileIndex.find(f => f.path === subPath);
+            if (match) {
+                const lastSlash = subPath.lastIndexOf("/");
+                dirPath = lastSlash === -1 ? "" : subPath.slice(0, lastSlash);
+                fileToOpen = match;
+            }
+        }
+        currentSubPath = dirPath;
+
         els.status.textContent = `${branchCache[branch].fileIndex.length} files in ${branch}`;
         renderLastUpdated(branchCache[branch].date);
         updateChangesButton();
         renderBreadcrumb();
-        ensureSidebarExpanded(branch, subPath);
+        ensureSidebarExpanded(branch, dirPath);
         renderSidebar();
         const activeRow = els.sidebar.querySelector(".tree-row.active");
         if (activeRow) activeRow.scrollIntoView({ block: "nearest" });
-        const node = nodeAtPath(branchCache[branch].tree, subPath);
+        const node = nodeAtPath(branchCache[branch].tree, dirPath);
         renderGrid(node || branchCache[branch].tree, branch);
 
         if (diff) {
             const [base, head] = diff.split("...");
             if (base && head) openDiffModal(branch, base, head);
+        } else if (fileToOpen) {
+            openDetail(branch, fileToOpen, categoryFor(fileToOpen.name));
         }
     } catch (e) {
         console.error(e);
@@ -771,6 +807,11 @@ async function openDetail(branch, item, cat) {
     els.modal.classList.add("open");
     els.modal.setAttribute("aria-hidden", "false");
     els.modalBody.innerHTML = `<div class="modal-loading">Loading...</div>`;
+
+    const targetHash = fileHash(branch, item);
+    if (location.hash !== targetHash) setHashSilently(targetHash);
+    currentOpenFile = { branch, subPath: currentSubPath };
+
     const url = rawUrl(branch, item.path);
     let previewHtml = "";
 
@@ -799,21 +840,30 @@ async function openDetail(branch, item, cat) {
         }
     }
 
+  const pageLink = buildFileLink(branch, item);
+
   els.modalBody.innerHTML = `
     <div class="modal-title">${escapeHtml(item.name)}</div>
     <div class="modal-path">${escapeHtml(branch)} / ${escapeHtml(item.path)}${item.size != null ? ` · ${formatSize(item.size)}` : ""}</div>
     <div class="modal-preview">${previewHtml}</div>
     <div class="modal-actions">
-      <a href="${url}" target="_blank" rel="noopener">Open raw</a>
+      <button type="button" class="modal-copy-page-link">Copy link</button>
       <a href="${url}" download="${item.name}">Download</a>
-      <button type="button" data-copy="${url}">Copy link</button>
+      <button type="button" data-copy="${url}">Copy raw link</button>
+      <a href="${url}" target="_blank" rel="noopener">Open raw</a>
     </div>
   `;
   const copyBtn = els.modalBody.querySelector("[data-copy]");
   copyBtn.onclick = () => {
     navigator.clipboard.writeText(copyBtn.dataset.copy);
     copyBtn.textContent = "Copied!";
-    setTimeout(() => (copyBtn.textContent = "Copy link"), 1500);
+    setTimeout(() => (copyBtn.textContent = "Copy raw link"), 1500);
+  };
+  const copyPageLinkBtn = els.modalBody.querySelector(".modal-copy-page-link");
+  copyPageLinkBtn.onclick = async () => {
+    const ok = await copyTextToClipboard(pageLink);
+    copyPageLinkBtn.textContent = ok ? "Copied!" : "Couldn't copy";
+    setTimeout(() => (copyPageLinkBtn.textContent = "Copy link"), 1500);
   };
 }
 
@@ -890,7 +940,7 @@ function renderDiff(branch, cmp, parentSha, currentSha, headDate) {
       <div class="diff-toolbar-actions">
         <button type="button" class="diff-toggle-all" data-action="expand">Expand all</button>
         <button type="button" class="diff-toggle-all" data-action="collapse">Collapse all</button>
-        <button type="button" class="diff-copy-link">🔗 Copy link</button>
+        <button type="button" class="diff-copy-link">Copy link</button>
       </div>
     </div>
   `;
@@ -902,7 +952,7 @@ function renderDiff(branch, cmp, parentSha, currentSha, headDate) {
       const url = `${location.origin}${location.pathname}${hash}`;
       const originalText = copyLinkBtn.textContent;
       const ok = await copyTextToClipboard(url);
-      copyLinkBtn.textContent = ok ? "🔗 Copied!" : "🔗 Couldn't copy";
+      copyLinkBtn.textContent = ok ? "Copied!" : "Couldn't copy";
       setTimeout(() => { copyLinkBtn.textContent = originalText; }, 1800);
     };
   }
@@ -1020,10 +1070,16 @@ function buildPatchHtml(patch) {
   return `<pre class="modal-text diff-patch">${highlighted}</pre>`;
 }
 
-function closeModal() {
+function closeModal(restoreUrl = true) {
   els.modal.classList.remove("open");
   els.modal.setAttribute("aria-hidden", "true");
   els.modalBody.innerHTML = "";
+
+  if (restoreUrl && currentOpenFile) {
+    const targetHash = folderHash(currentOpenFile.branch, currentOpenFile.subPath);
+    if (location.hash !== targetHash) setHashSilently(targetHash, { push: false });
+  }
+  currentOpenFile = null;
 }
 
 els.modal.addEventListener("click", (e) => {
