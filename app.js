@@ -6,6 +6,7 @@ const REPO_CONFIG = {
 
 const API_BASE = "https://mrrp-proxy.retreat743.workers.dev/api/gh";
 const RAW_BASE = "https://raw.githubusercontent.com";
+const SHARE_BASE = "https://mrrp-share.retreat743.workers.dev";
 
 let branches = [];
 let branchCache = {};
@@ -264,6 +265,11 @@ function fileHash(branch, item) {
 
 function buildFileLink(branch, item) {
   return `${location.origin}${location.pathname}${fileHash(branch, item)}`;
+}
+
+function buildShareLink(branch, item) {
+  const params = new URLSearchParams({ b: branch, p: item.path });
+  return `${SHARE_BASE}/f?${params.toString()}`;
 }
 
 function setHashSilently(hash, { push = true } = {}) {
@@ -840,7 +846,7 @@ async function openDetail(branch, item, cat) {
         }
     }
 
-  const pageLink = buildFileLink(branch, item);
+  const pageLink = buildShareLink(branch, item);
 
   els.modalBody.innerHTML = `
     <div class="modal-title">${escapeHtml(item.name)}</div>
